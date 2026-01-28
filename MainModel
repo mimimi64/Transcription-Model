@@ -47,7 +47,7 @@ batch_size = 8
 compute_type = "int8"  # Best for CPU speed
 hf_token = "(Your Hugging Face Token here" # Hugging Face Token
 
-#  Path Management (The Organized Way)
+#  Path Management
 # Point this to your main project folder
 base_path = r"Filepath for Project folder you create"
 
@@ -188,7 +188,7 @@ if stage < 3:
     print(f"Found {len(diarize_segments)} diarization segments")
 
     # Assign speakers
-    # Convert our list to a DataFrame so WhisperX can read it
+    # Convert your list to a DataFrame so WhisperX can read it
     diarize_df = pd.DataFrame(diarize_segments)
 
     # Now pass the DataFrame to the assignment function
@@ -208,7 +208,7 @@ if stage < 3:
 # PERIODIC CHECKPOINT DURING PRINTING
 auto_checkpoint = time.time()
 
-# PRINT AND BUILD HUMAN-READABLE TRANSCRIPT
+# PRINT AND BUILD READABLE TRANSCRIPT
 print("🎤 Final transcript:")
 with open(transcript_path, 'a') as tf:
     segments = result.get('segments', [])
