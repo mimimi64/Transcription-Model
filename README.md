@@ -1,7 +1,7 @@
 Pipeline to Pipeline transcription model built off of the WhisperX library with Pyannote. Comes with Word Alignment, and Speaker Diarization (identifying who said what).
 
 Features:
-Processing: Uses a checkpoint system to save progress after each stage (Transcribe → Align → Diarize), so you dont too much work if there are issues (you can change the checkpoint value, and batch number)
+Processing: Uses a checkpoint system to save progress after each stage (Transcribe → Align → Diarize), so you dont lose too much work if there are issues, like with your device or the environment (you can change the checkpoint value, and batch number).
 
 Workflow: Creates and manages project folders for audio inputs, checkpoints, and final transcripts.
 
