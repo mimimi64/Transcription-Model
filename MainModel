@@ -1,0 +1,259 @@
+import torch
+original_load = torch.load
+def trusted_load(*args, **kwargs):
+    kwargs['weights_only'] = False
+    return original_load(*args, **kwargs)
+torch.load = trusted_load
+torch.serialization.add_safe_globals([list])
+import whisperx
+import gc
+import os
+import time
+import json
+import pandas as pd  # for potential DataFrame handling
+from typing import Dict, Any, List
+import torch.serialization
+from omegaconf.listconfig import ListConfig
+from omegaconf.base import ContainerMetadata
+from omegaconf.dictconfig import DictConfig
+from typing import Any
+import nltk
+import ssl
+
+# Bypass SSL certificate verification for NLTK downloads
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    pass
+else:
+    ssl._create_default_https_context = _create_unverified_https_context
+
+# Force download the missing resource
+nltk.download('punkt_tab')
+torch.serialization.add_safe_globals([ListConfig, ContainerMetadata, DictConfig, Any])
+
+# 🍵 Prevent system sleep on macOS
+caffeinate = None
+if os.uname().sysname == "Darwin":
+    import subprocess
+    caffeinate = subprocess.Popen(["caffeinate"])
+
+# CONFIGURATION (edit these or use argparse later)
+#  System Setup
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device} (MPS fallback to CPU for WhisperX compatibility)")
+
+batch_size = 8
+compute_type = "int8"  # Best for CPU speed
+hf_token = "(Your Hugging Face Token here" # Hugging Face Token
+
+#  Path Management (The Organized Way)
+# Point this to your main project folder
+base_path = r"Filepath for Project folder you create"
+
+# Define sub-paths
+audio_file      = os.path.join(base_path, "audio_input", "Your Audio File")
+checkpoint_path = os.path.join(base_path, "checkpoints", "checkpoint.json")
+transcript_path = os.path.join(base_path, "outputs", "transcript.txt")
+
+#  Auto-Folder Creation & Safety Check
+# This logic ensures the script doesn't crash if folders are missing
+for folder in [os.path.dirname(audio_file), os.path.dirname(checkpoint_path), os.path.dirname(transcript_path)]:
+    os.makedirs(folder, exist_ok=True)
+
+if not os.path.exists(audio_file):
+    print(f"❌ ERROR: Audio file not found at: {audio_file}")
+    print(f"Please place your recording in the 'audio_input' folder and name it 'Properly'")
+    # This stop prevents the "ffmpeg version..." crash later
+    import sys; sys.exit()
+checkpoint_interval = 5  # seconds during printing
+
+# SPEAKER MAP
+speaker_map = {
+    "SPEAKER_00": "Name1",
+    "SPEAKER_01": "Name2",
+    # add more as needed
+}
+
+# LOAD OR INITIALIZE CHECKPOINT
+if os.path.exists(checkpoint_path):
+    with open(checkpoint_path, 'r') as f:
+        cp: Dict[str, Any] = json.load(f)
+    stage = cp.get('stage', 0)
+    segments = cp.get('segments', [])
+    word_segments = cp.get('word_segments', [])
+    language = cp.get('language')
+    last_printed = cp.get('last_printed', 0)
+    result = {
+        'language': language,
+        'segments': segments,
+        'word_segments': word_segments if word_segments else None,
+    }
+    print(f"📂 Loaded checkpoint (stage={stage}, last_printed={last_printed})")
+else:
+    stage = 0
+    result = {}
+    last_printed = 0
+
+# prepare audio and timer
+audio = None
+start_time = time.time()
+
+# 1. TRANSCRIBE
+if stage < 1:
+    print("🎹 Loading transcription model...")
+    # Allowlist OmegaConf ListConfig for safe loading of pyannote VAD models (PyTorch 2.6+ security)
+    torch.serialization.add_safe_globals([ListConfig])
+    # Fix for PyTorch 2.6+ security blocks on pyannote/OmegaConf configs
+    torch.serialization.add_safe_globals([ListConfig, ContainerMetadata])
+    model = whisperx.load_model("large-v3", device, compute_type=compute_type)
+    audio = whisperx.load_audio(audio_file)
+    print("✨ Transcribing audio...")
+    result = model.transcribe(audio, batch_size=batch_size, language=None)  # auto-detect
+    stage = 1
+    # Save minimal checkpoint
+    cp_data = {
+        'stage': stage,
+        'language': result.get('language'),
+        'segments': result.get('segments', []),
+        'word_segments': result.get('word_segments', []),
+        'last_printed': last_printed
+    }
+    with open(checkpoint_path, 'w') as f:
+        json.dump(cp_data, f, indent=2)
+    print(f"📅 Checkpoint saved after transcription (stage=1)")
+
+# 2. ALIGN
+if stage < 2:
+    if audio is None:
+        audio = whisperx.load_audio(audio_file)
+    print("🔧 Aligning words...")
+    align_model, metadata = whisperx.load_align_model(language_code=result['language'], device=device)
+    align_output = whisperx.align(
+        result.get('segments', []),
+        align_model,
+        metadata,
+        audio,
+        device,
+        return_char_alignments=False
+    )
+    result['segments'] = align_output['segments']
+    if 'word_segments' in align_output:
+        result['word_segments'] = align_output['word_segments']
+    stage = 2
+    cp_data = {
+        'stage': stage,
+        'language': result.get('language'),
+        'segments': result['segments'],
+        'word_segments': result.get('word_segments', []),
+        'last_printed': last_printed
+    }
+    with open(checkpoint_path, 'w') as f:
+        json.dump(cp_data, f, indent=2)
+    print(f"📅 Checkpoint saved after alignment (stage=2)")
+
+# 3. DIARIZE
+if stage < 3:
+    if audio is None:
+        audio = whisperx.load_audio(audio_file)
+    print("🧑‍🧑 Loading diarization model...")
+    from whisperx.diarize import DiarizationPipeline
+
+    diarize_model = DiarizationPipeline(
+        use_auth_token=hf_token,
+        device=device
+    )
+    print("👂 Running diarization...")
+    diarization_output = diarize_model(audio, min_speakers=2, max_speakers=2)
+
+    # Convert output to list of dicts (handles Annotation or DataFrame)
+    diarize_segments: List[Dict[str, Any]] = []
+    if hasattr(diarization_output, 'itertracks'):  # pyannote Annotation
+        for turn, _, speaker in diarization_output.itertracks(yield_label=True):
+            diarize_segments.append({
+                'start': float(turn.start),
+                'end': float(turn.end),
+                'speaker': speaker  # e.g. "SPEAKER_00"
+            })
+    elif isinstance(diarization_output, pd.DataFrame):
+        for _, row in diarization_output.iterrows():
+            diarize_segments.append({
+                'start': float(row['start']),
+                'end': float(row['end']),
+                'speaker': row['label']
+            })
+    else:
+        raise TypeError(f"Unexpected diarization output: {type(diarization_output)}")
+
+    print(f"Found {len(diarize_segments)} diarization segments")
+
+    # Assign speakers
+    # Convert our list to a DataFrame so WhisperX can read it
+    diarize_df = pd.DataFrame(diarize_segments)
+
+    # Now pass the DataFrame to the assignment function
+    result = whisperx.assign_word_speakers(diarize_df, result)
+    stage = 3
+    cp_data = {
+        'stage': stage,
+        'language': result.get('language'),
+        'segments': result.get('segments', []),
+        'word_segments': result.get('word_segments', []),
+        'last_printed': last_printed
+    }
+    with open(checkpoint_path, 'w') as f:
+        json.dump(cp_data, f, indent=2)
+    print(f"📅 Checkpoint saved after diarization (stage=3)")
+
+# PERIODIC CHECKPOINT DURING PRINTING
+auto_checkpoint = time.time()
+
+# PRINT AND BUILD HUMAN-READABLE TRANSCRIPT
+print("🎤 Final transcript:")
+with open(transcript_path, 'a') as tf:
+    segments = result.get('segments', [])
+    for idx in range(last_printed, len(segments)):
+        segment = segments[idx]
+        start = segment.get('start', 0)
+        end = segment.get('end', 0)
+        speaker_id = segment.get('speaker', 'Unknown')
+        speaker = speaker_map.get(speaker_id, speaker_id)  # fallback to ID if not mapped
+        text = segment.get('text', '').strip()
+        line = f"[{start:.2f}-{end:.2f}] {speaker}: {text}"
+        print(line)
+        tf.write(f"{line}\n")
+        last_printed += 1
+
+        # auto JSON checkpoint
+        if time.time() - auto_checkpoint > checkpoint_interval:
+            cp_data = {
+                'stage': stage,
+                'language': result.get('language'),
+                'segments': segments,
+                'word_segments': result.get('word_segments', []),
+                'last_printed': last_printed
+            }
+            with open(checkpoint_path, 'w') as f:
+                json.dump(cp_data, f, indent=2)
+            print(f"📅 Auto-checkpoint at segment {idx}")
+            auto_checkpoint = time.time()
+
+# FINAL SAVE
+cp_data = {
+    'stage': stage,
+    'language': result.get('language'),
+    'segments': segments,
+    'word_segments': result.get('word_segments', []),
+    'last_printed': last_printed
+}
+with open(checkpoint_path, 'w') as f:
+    json.dump(cp_data, f, indent=2)
+print(f"📄 Transcript saved to {transcript_path}")
+
+# CLEAN UP
+gc.collect()
+if device == "cuda":
+    torch.cuda.empty_cache()
+if caffeinate:
+    caffeinate.terminate()
+print("💅✨ All done!")
