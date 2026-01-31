@@ -43,9 +43,9 @@ if os.uname().sysname == "Darwin":
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device} (MPS fallback to CPU for WhisperX compatibility)")
 
-batch_size = 8
+batch_size = 8 
 compute_type = "int8"  # Best for CPU speed
-hf_token = "(Your Hugging Face Token here" # Hugging Face Token
+hf_token = "Your Hugging Face Token here" # Hugging Face Token
 
 #  Path Management
 # Point this to your main project folder
