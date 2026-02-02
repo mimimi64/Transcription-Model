@@ -1,7 +1,7 @@
 Trouble Shooting
 
 Since the process works by downloading the whole audio first, before performing transcription, I recommend you start with a small audio sample, maybe one minute
-or so. This way, you will start to see the output quicker and be abe to check if anything is wrong. Initially, it can take a 1 or 2 minutes to process
+or so. This way, you will start to see the output quicker and be abe to check if anything is wrong. Initially, it can take 1 or 2 minutes to process
 a 1 minute audio, load the model, and tokenize the converted wavelength data into chunks to be interpretted. So for 1 hour audios, expect more time initially 
 upon startup, maybe half an hour to an hour, possibly quicker if you can programme your GPU to be involved, although this is not possible with most Macs.
 
