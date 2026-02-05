@@ -30,6 +30,8 @@ Place your audio file inside TranscriptionProject/audio_input/.
 
 Hugging Face Token: Make sure you have generated a Hugging Face token (this is free) with access to the pyannote/speaker-diarization-3.1 model.
 
+In the code, find and set the min_speakers and max_speakers values to the number of speakers in the audio, this helps force the model to choose between voice "blueprints" that have already been created. Note: I myself have only tested this model on audios with 2 speakers.
+
 Structure:
 audio_input/: Place your .m4a or .wav files here.
 
