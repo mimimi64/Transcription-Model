@@ -1,4 +1,1 @@
-I am aware that some of the speaker mapping is not quite working - this is seperate to the diarisation. It just means people are being named differently - ie 
-as an entirely new speaker some of the time, as opposed to "remembering" who the voice belonged to. This is more of an admin problem which I intend to fix soon.
-
-Also, I am aware this project is not using any of the Whisper turbo models. I am also going to change this eventually.
+I am aware this project is not using any of the Whisper turbo models. I am going to change this eventually.
