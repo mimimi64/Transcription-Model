@@ -155,48 +155,84 @@ if stage < 2:
         json.dump(cp_data, f, indent=2)
     print(f"📅 Checkpoint saved after alignment (stage=2)")
 
-# 3. DIARIZE
-if stage < 3:
-    if audio is None:
-        audio = whisperx.load_audio(audio_file)
-    print("🧑‍🧑 Loading diarization model...")
-    from whisperx.diarize import DiarizationPipeline
+# 3. DIARIZE and MAPPING
+    if stage < 3:
+        if audio is None:
+            audio = whisperx.load_audio(audio_file)
 
-    diarize_model = DiarizationPipeline(
-        use_auth_token=hf_token,
-        device=device
-    )
-    print("👂 Running diarization...")
-    diarization_output = diarize_model(audio, min_speakers=2, max_speakers=2)
+        print("🧑‍🧑 Loading diarization model...")
+        from whisperx.diarize import DiarizationPipeline
+        from collections import Counter
 
-    # Convert output to list of dicts (handles Annotation or DataFrame)
-    diarize_segments: List[Dict[str, Any]] = []
-    if hasattr(diarization_output, 'itertracks'):  # pyannote Annotation
-        for turn, _, speaker in diarization_output.itertracks(yield_label=True):
-            diarize_segments.append({
-                'start': float(turn.start),
-                'end': float(turn.end),
-                'speaker': speaker  # e.g. "SPEAKER_00"
-            })
-    elif isinstance(diarization_output, pd.DataFrame):
-        for _, row in diarization_output.iterrows():
-            diarize_segments.append({
-                'start': float(row['start']),
-                'end': float(row['end']),
-                'speaker': row['label']
-            })
-    else:
-        raise TypeError(f"Unexpected diarization output: {type(diarization_output)}")
+        diarize_model = DiarizationPipeline(use_auth_token=hf_token, device=device)
+        print("👂 Running diarization...")
+        # This identifies the timing for Speakers
+        diarization_output = diarize_model(audio, min_speakers=2, max_speakers=2)
 
-    print(f"Found {len(diarize_segments)} diarization segments")
+        # Standardize diarization segments into a DataFrame
+        if hasattr(diarization_output, 'itertracks'):
+            diarize_segments = [{'start': t.start, 'end': t.end, 'speaker': s} for t, _, s in
+                                diarization_output.itertracks(yield_label=True)]
+        else:
+            diarize_segments = diarization_output.to_dict('records')
 
-    # Assign speakers
-    # Convert your list to a DataFrame so WhisperX can read it
-    diarize_df = pd.DataFrame(diarize_segments)
+        diarize_df = pd.DataFrame(diarize_segments)
 
-    # Now pass the DataFrame to the assignment function
-    result = whisperx.assign_word_speakers(diarize_df, result)
-    stage = 3
+        # Initial assignment (This is where random ID's can potentially be created by the Model)
+        result = whisperx.assign_word_speakers(diarize_df, result)
+
+        print("🔍 Running Speaker Alignment (Cleaning labels)...")
+
+        # (Part 1) Identify all unique labels the model actually generated (including random ones)
+        M_labels = set()
+        for segment in result["segments"]:
+            for word in segment.get("words", []):
+                if "speaker" in word:
+                    M_labels.add(word["speaker"])
+
+        # (Part 2) Create a dynamic mapping table
+        label_mapping_table = {}
+        for M_label in M_labels:
+            # If it's already a standard speaker ID, keep it as is
+            if str(M_label).startswith("SPEAKER_"):
+                label_mapping_table[M_label] = M_label
+                continue
+
+            overlaps = []
+            # Find every word where the Model used this specific label
+            for segment in result["segments"]:
+                for word in segment.get("words", []):
+                    if word.get("speaker") == M_label:
+                        w_s, w_e = word["start"], word["end"]
+                        # Find which 'SPEAKER_XX' was officially talking during this word's time
+                        matches = diarize_df[(diarize_df['start'] < w_e) & (diarize_df['end'] > w_s)]
+                        if not matches.empty:
+                            overlaps.extend(matches['speaker'].tolist())
+
+            # Assign the random label (letters etc.) to the real speaker ID it matched most often
+            if overlaps:
+                label_mapping_table[M_label] = Counter(overlaps).most_common(1)[0][0]
+            else:
+                label_mapping_table[M_label] = "Unknown"
+
+        # (Part 3) Apply the mapping to fix the final result
+        for segment in result["segments"]:
+            valid_segment_speakers = []
+            for word in segment.get("words", []):
+                original_label = word.get("speaker")
+                fixed_label = label_mapping_table.get(original_label, "Unknown")
+                word["speaker"] = fixed_label
+                if fixed_label != "Unknown":
+                    valid_segment_speakers.append(fixed_label)
+
+            # Force the overall segment speaker to match the most frequent word speaker
+            if valid_segment_speakers:
+                segment["speaker"] = Counter(valid_segment_speakers).most_common(1)[0][0]
+            else:
+                # Fallback to whatever the segment already had if words aren't tagged
+                pass
+
+        stage = 3
     cp_data = {
         'stage': stage,
         'language': result.get('language'),
