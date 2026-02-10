@@ -1,4 +1,6 @@
-Pipeline to Pipeline transcription model built off of the WhisperX library with Pyannote. Comes with Word Alignment, and Speaker Diarization (identifying who said what).
+Pipeline to Pipeline transcription model built off of the WhisperX library with Pyannote. Comes with Word Alignment, and Speaker Diarization (identifying who said what). 
+
+This transcription tool stays entirely local to your device, so your data and your audios are too, whereas in commercial software you pay for, your data/audio is often sent to a 3rd party cloud or database that is out of your control. With this, one can have data sovereignty at no cost.
 
 Features:
 Processing: Uses a checkpoint system to save progress after each stage (Transcribe → Align → Diarize), so you dont lose too much work if there are issues, like with your device or the environment (you can change the checkpoint value, and batch number).
