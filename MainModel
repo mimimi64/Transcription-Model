@@ -178,6 +178,18 @@ if stage < 2:
 
         diarize_df = pd.DataFrame(diarize_segments)
 
+        #FIX: Force Chronological Labeling ---
+        # 1. Find the first time each speaker appears
+        first_appearances = diarize_df.groupby('speaker')['start'].min().sort_values()
+        
+        # 2. Map the model's random IDs to 00, 01, 02, 03, etc based on appearance order
+        chrono_map = {old_id: f"SPEAKER_{i:02d}" for i, old_id in enumerate(first_appearances.index)}
+        
+        # 3. Apply the mapping to the dataframe
+        diarize_df['speaker'] = diarize_df['speaker'].map(chrono_map)
+        print(f"🔄 Re-mapped speakers by order of apperance: {chrono_map}")
+        # ---------------------------------------------
+
         # Initial assignment (This is where random ID's can potentially be created by the Model)
         result = whisperx.assign_word_speakers(diarize_df, result)
 
