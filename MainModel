@@ -105,14 +105,21 @@ start_time = time.time()
 # 1. TRANSCRIBE
 if stage < 1:
     print("🎹 Loading transcription model...")
-    # Allowlist OmegaConf ListConfig for safe loading of pyannote VAD models (PyTorch 2.6+ security)
-    torch.serialization.add_safe_globals([ListConfig])
-    # Fix for PyTorch 2.6+ security blocks on pyannote/OmegaConf configs
-    torch.serialization.add_safe_globals([ListConfig, ContainerMetadata])
-    model = whisperx.load_model("large-v3", device, compute_type=compute_type)
+    #Point directly to a CTranslate2 Turbo model
+    turbo_model_id = "deepdml/faster-whisper-large-v3-turbo-ct2"
+     
+    #Fix for PyTorch 2.6+ security blocks on pyannote/OmegaConf configs
+    torch.serialization.add_safe_globals([ListConfig, ContainerMetadata, DictConfig])
+
+    # On Mac, 'cpu' is standard for WhisperX alignment stability.
+    # Optional: Use 'float32' for CPU or 'float16' if you're trying 'cuda' on a different machine.
+    model = whisperx.load_model(turbo_model_id, device, compute_type=compute_type)
+
     audio = whisperx.load_audio(audio_file)
-    print("✨ Transcribing audio...")
-    result = model.transcribe(audio, batch_size=batch_size, language=None)  # auto-detect
+    print("✨ Transcribing audio with Large-v3-Turbo (4 decoder layers)...")
+
+    # We keep batch_size consistent
+    result = model.transcribe(audio, batch_size=batch_size, language=None)
     stage = 1
     # Save minimal checkpoint
     cp_data = {
