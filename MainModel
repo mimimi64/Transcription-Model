@@ -71,7 +71,7 @@ if not os.path.exists(audio_file):
     import sys; sys.exit()
 checkpoint_interval = 5  # seconds during printing
 
-# SPEAKER MAP
+# SPEAKER MAP - Speakers should be listed in chronological order of appearance here.
 speaker_map = {
     "SPEAKER_00": "Name1",
     "SPEAKER_01": "Name2",
