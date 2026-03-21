@@ -1,0 +1,8 @@
+The Main model works well with multiple speakers, even when they overlap, and there is background noise. However, where there is background noise
+that is human chatter, the speaker mapping is not accurate. Thus I have made a new branch in the code which deals with background chatter for two
+people tlaking in the foreground. So far I have found it works decently for 2 people, but it's not as good as the first model without background 
+chatter. I cant guarantee it will work well for more than 2, although you can fiddle with the settings and see if this helps.
+
+It's worth noting that sometimes if a speaker coughs or breathes before someone else you have listed speaks first, like in the first few seconds
+of the audio especially, the model can allocate the name you put second as the first person to talk of those two. You may want to switch round 
+names in this case.
