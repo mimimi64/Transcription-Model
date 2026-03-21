@@ -4,17 +4,21 @@
 import torch
 original_load = torch.load
 def trusted_load(*args, **kwargs):
-    kwargs['weights_only'] = False
+    kwargs["weights_only"] = False
     return original_load(*args, **kwargs)
 torch.load = trusted_load
 torch.serialization.add_safe_globals([list])
+
 import whisperx
 import gc
 import os
 import time
 import json
-import pandas as pd  # for potential DataFrame handling
-from typing import Dict, Any, List
+import math
+import numpy as np
+import pandas as pd
+
+from typing import Dict, Any, List, Optional, Tuple
 import torch.serialization
 from omegaconf.listconfig import ListConfig
 from omegaconf.base import ContainerMetadata
@@ -22,6 +26,18 @@ from omegaconf.dictconfig import DictConfig
 from typing import Any
 import nltk
 import ssl
+from collections import Counter, defaultdict
+
+# ---------------------------
+# OPTIONAL: Speaker embedding model
+# ---------------------------
+try:
+    from speechbrain.inference.speaker import EncoderClassifier
+except ImportError:
+    raise ImportError(
+        "SpeechBrain is required for global speaker blueprints.\n"
+        "Install with: pip install speechbrain"
+    )
 
 # Bypass SSL certificate verification for NLTK downloads
 try:
@@ -32,7 +48,7 @@ else:
     ssl._create_default_https_context = _create_unverified_https_context
 
 # Force download the missing resource
-nltk.download('punkt_tab')
+nltk.download("punkt_tab")
 torch.serialization.add_safe_globals([ListConfig, ContainerMetadata, DictConfig, Any])
 
 # 🍵 Prevent system sleep on macOS
@@ -41,271 +57,516 @@ if os.uname().sysname == "Darwin":
     import subprocess
     caffeinate = subprocess.Popen(["caffeinate"])
 
-# CONFIGURATION (edit these or use argparse later)
-#  System Setup
+# ===========================
+# CONFIGURATION
+# ===========================
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device} (MPS fallback to CPU for WhisperX compatibility)")
 
-batch_size = 8 
-compute_type = "int8"  # Best for CPU speed
-hf_token = "Your Hugging Face Token here" # Hugging Face Token
+batch_size = 8
+compute_type = "int8"
+hf_token = "Your Hugging Face Token here"
 
-#  Path Management
-# Point this to your main project folder
 base_path = r"Filepath for Project folder you create"
 
-# Define sub-paths
-audio_file      = os.path.join(base_path, "audio_input", "Your Audio File")
+audio_file      = os.path.join(base_path, "audio_input", "Audio File name goes here")
 checkpoint_path = os.path.join(base_path, "checkpoints", "checkpoint.json")
 transcript_path = os.path.join(base_path, "outputs", "transcript.txt")
 
-#  Auto-Folder Creation & Safety Check
-# This logic ensures the script doesn't crash if folders are missing
 for folder in [os.path.dirname(audio_file), os.path.dirname(checkpoint_path), os.path.dirname(transcript_path)]:
     os.makedirs(folder, exist_ok=True)
 
 if not os.path.exists(audio_file):
     print(f"❌ ERROR: Audio file not found at: {audio_file}")
-    print(f"Please place your recording in the 'audio_input' folder and name it 'Properly'")
-    # This stop prevents the "ffmpeg version..." crash later
-    import sys; sys.exit()
-checkpoint_interval = 5  # seconds during printing
+    print(f"Please place your recording in the 'audio_input' folder and name it properly")
+    import sys
+    sys.exit()
 
-# SPEAKER MAP - Speakers should be listed in chronological order of appearance here.
+checkpoint_interval = 5
+
+
+# USER speaker map
 speaker_map = {
     "SPEAKER_00": "Name1",
     "SPEAKER_01": "Name2",
-    # add more as needed
+
 }
+
+
+# Chunking + blueprint config
+
+CHUNK_SECONDS = 180            # 3 minutes
+CHUNK_OVERLAP_SECONDS = 15     # overlap to reduce boundary issues
+SAMPLE_RATE = 16000            # whisperx.load_audio is typically 16k mono
+
+
+DIAR_MIN_SPEAKERS = 2
+DIAR_MAX_SPEAKERS = 2
+
+# Blueprint matching
+BLUEPRINT_MATCH_THRESHOLD = 0.75
+BLUEPRINT_UPDATE_ALPHA = 0.10
+MIN_EMBED_SEGMENT_SEC = 1.5
+MAX_EMBED_SEGMENTS_PER_LOCAL_SPK = 3
 
 # LOAD OR INITIALIZE CHECKPOINT
 if os.path.exists(checkpoint_path):
-    with open(checkpoint_path, 'r') as f:
+    with open(checkpoint_path, "r") as f:
         cp: Dict[str, Any] = json.load(f)
-    stage = cp.get('stage', 0)
-    segments = cp.get('segments', [])
-    word_segments = cp.get('word_segments', [])
-    language = cp.get('language')
-    last_printed = cp.get('last_printed', 0)
+
+    stage = cp.get("stage", 0)
+    segments = cp.get("segments", [])
+    word_segments = cp.get("word_segments", [])
+    language = cp.get("language")
+    last_printed = cp.get("last_printed", 0)
+
+    # Restore blueprints
+    speaker_blueprints = cp.get("speaker_blueprints", {})
+    for spk_id in speaker_blueprints:
+        if "centroid" in speaker_blueprints[spk_id]:
+            speaker_blueprints[spk_id]["centroid"] = np.array(
+                speaker_blueprints[spk_id]["centroid"], dtype=np.float32
+            )
+
     result = {
-        'language': language,
-        'segments': segments,
-        'word_segments': word_segments if word_segments else None,
+        "language": language,
+        "segments": segments,
+        "word_segments": word_segments if word_segments else None,
     }
     print(f"📂 Loaded checkpoint (stage={stage}, last_printed={last_printed})")
 else:
     stage = 0
     result = {}
     last_printed = 0
+    speaker_blueprints = {}
 
 # prepare audio and timer
 audio = None
 start_time = time.time()
 
-# 1. TRANSCRIBE
-if stage < 1:
-    print("🎹 Loading transcription model...")
-    #Point directly to a CTranslate2 Turbo model
-    turbo_model_id = "deepdml/faster-whisper-large-v3-turbo-ct2"
-     
-    #Fix for PyTorch 2.6+ security blocks on pyannote/OmegaConf configs
-    torch.serialization.add_safe_globals([ListConfig, ContainerMetadata, DictConfig])
 
-    # On Mac, 'cpu' is standard for WhisperX alignment stability.
-    # Optional: Use 'float32' for CPU or 'float16' if you're trying 'cuda' on a different machine.
-    model = whisperx.load_model(turbo_model_id, device, compute_type=compute_type)
+# HELPERS
 
-    audio = whisperx.load_audio(audio_file)
-    print("✨ Transcribing audio with Large-v3-Turbo (4 decoder layers)...")
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    a_norm = np.linalg.norm(a) + 1e-8
+    b_norm = np.linalg.norm(b) + 1e-8
+    return float(np.dot(a, b) / (a_norm * b_norm))
 
-    # We keep batch_size consistent
-    result = model.transcribe(audio, batch_size=batch_size, language=None)
-    stage = 1
-    # Save minimal checkpoint
+def normalize_embedding(vec: np.ndarray) -> np.ndarray:
+    return vec / (np.linalg.norm(vec) + 1e-8)
+
+def get_next_global_speaker_id(existing_ids: List[str]) -> str:
+    nums = []
+    for spk in existing_ids:
+        if str(spk).startswith("SPEAKER_"):
+            try:
+                nums.append(int(str(spk).split("_")[1]))
+            except Exception:
+                pass
+    next_num = max(nums) + 1 if nums else 0
+    return f"SPEAKER_{next_num:02d}"
+
+def save_checkpoint(stage_val, language_val, segments_val, word_segments_val, last_printed_val, blueprints_val):
+    serializable_blueprints = {}
+    for spk_id, info in blueprints_val.items():
+        serializable_blueprints[spk_id] = {
+            "centroid": info["centroid"].tolist(),
+            "count": info.get("count", 1)
+        }
+
     cp_data = {
-        'stage': stage,
-        'language': result.get('language'),
-        'segments': result.get('segments', []),
-        'word_segments': result.get('word_segments', []),
-        'last_printed': last_printed
+        "stage": stage_val,
+        "language": language_val,
+        "segments": segments_val,
+        "word_segments": word_segments_val,
+        "last_printed": last_printed_val,
+        "speaker_blueprints": serializable_blueprints
     }
-    with open(checkpoint_path, 'w') as f:
+    with open(checkpoint_path, "w") as f:
         json.dump(cp_data, f, indent=2)
-    print(f"📅 Checkpoint saved after transcription (stage=1)")
 
-# 2. ALIGN
-if stage < 2:
-    if audio is None:
-        audio = whisperx.load_audio(audio_file)
-    print("🔧 Aligning words...")
-    align_model, metadata = whisperx.load_align_model(language_code=result['language'], device=device)
+def get_chunk_ranges(total_seconds: float, chunk_seconds: int, overlap_seconds: int) -> List[Tuple[float, float]]:
+    ranges = []
+    step = chunk_seconds - overlap_seconds
+    if step <= 0:
+        raise ValueError("CHUNK_SECONDS must be greater than CHUNK_OVERLAP_SECONDS.")
+    current_start = 0.0
+    while current_start < total_seconds:
+        current_end = min(total_seconds, current_start + chunk_seconds)
+        ranges.append((current_start, current_end))
+        if current_end >= total_seconds:
+            break
+        current_start += step
+    return ranges
+
+def slice_audio(audio_array: np.ndarray, start_sec: float, end_sec: float, sr: int = SAMPLE_RATE) -> np.ndarray:
+    s = max(0, int(start_sec * sr))
+    e = min(len(audio_array), int(end_sec * sr))
+    return audio_array[s:e]
+
+def convert_diarization_output_to_df(diarization_output) -> pd.DataFrame:
+    if hasattr(diarization_output, "itertracks"):
+        diarize_segments = [
+            {"start": t.start, "end": t.end, "speaker": s}
+            for t, _, s in diarization_output.itertracks(yield_label=True)
+        ]
+    else:
+        diarize_segments = diarization_output.to_dict("records")
+
+    diarize_df = pd.DataFrame(diarize_segments)
+    if diarize_df.empty:
+        return pd.DataFrame(columns=["start", "end", "speaker"])
+
+    diarize_df = diarize_df.sort_values(["start", "end"]).reset_index(drop=True)
+    return diarize_df
+
+def shift_result_timestamps(local_result: Dict[str, Any], offset_sec: float) -> Dict[str, Any]:
+    shifted = {"language": local_result.get("language"), "segments": [], "word_segments": []}
+
+    for segment in local_result.get("segments", []):
+        seg = dict(segment)
+        if "start" in seg:
+            seg["start"] = float(seg["start"]) + offset_sec
+        if "end" in seg:
+            seg["end"] = float(seg["end"]) + offset_sec
+
+        words_out = []
+        for word in seg.get("words", []):
+            w = dict(word)
+            if "start" in w:
+                w["start"] = float(w["start"]) + offset_sec
+            if "end" in w:
+                w["end"] = float(w["end"]) + offset_sec
+            words_out.append(w)
+            shifted["word_segments"].append(w)
+
+        seg["words"] = words_out
+        shifted["segments"].append(seg)
+
+    return shifted
+
+def update_blueprint(global_id: str, embedding: np.ndarray):
+    global speaker_blueprints
+
+    if global_id not in speaker_blueprints:
+        speaker_blueprints[global_id] = {
+            "centroid": normalize_embedding(embedding),
+            "count": 1
+        }
+        return
+
+    old_centroid = speaker_blueprints[global_id]["centroid"]
+    new_centroid = normalize_embedding(
+        (1.0 - BLUEPRINT_UPDATE_ALPHA) * old_centroid + BLUEPRINT_UPDATE_ALPHA * embedding
+    )
+    speaker_blueprints[global_id]["centroid"] = new_centroid
+    speaker_blueprints[global_id]["count"] += 1
+
+def extract_local_speaker_embeddings(
+    diarize_df: pd.DataFrame,
+    chunk_audio: np.ndarray,
+    encoder
+) -> Dict[str, np.ndarray]:
+    """
+    Build one embedding per local diarized speaker from several usable spans.
+    """
+    local_embeddings = {}
+
+    for local_spk in diarize_df["speaker"].unique():
+        speaker_rows = diarize_df[diarize_df["speaker"] == local_spk].copy()
+        speaker_rows["duration"] = speaker_rows["end"] - speaker_rows["start"]
+        speaker_rows = speaker_rows[speaker_rows["duration"] >= MIN_EMBED_SEGMENT_SEC]
+        speaker_rows = speaker_rows.sort_values("duration", ascending=False)
+
+        candidate_embeddings = []
+        for _, row in speaker_rows.head(MAX_EMBED_SEGMENTS_PER_LOCAL_SPK).iterrows():
+            s = float(row["start"])
+            e = float(row["end"])
+            clip = slice_audio(chunk_audio, s, e, SAMPLE_RATE)
+            if len(clip) < int(MIN_EMBED_SEGMENT_SEC * SAMPLE_RATE):
+                continue
+
+            wav = torch.tensor(clip, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                emb = encoder.encode_batch(wav)
+
+            emb = emb.squeeze().detach().cpu().numpy()
+            emb = normalize_embedding(emb)
+            candidate_embeddings.append(emb)
+
+        if candidate_embeddings:
+            avg_emb = normalize_embedding(np.mean(np.stack(candidate_embeddings), axis=0))
+            local_embeddings[local_spk] = avg_emb
+
+    return local_embeddings
+
+def match_local_speakers_to_global(
+    local_embeddings: Dict[str, np.ndarray]
+) -> Dict[str, str]:
+    """
+    Match local chunk speakers to persistent global speakers using cosine similarity.
+    If no match is strong enough, create a new global speaker ID.
+    """
+    local_to_global = {}
+    used_global_ids = set()
+
+    for local_spk, emb in local_embeddings.items():
+        best_global_id = None
+        best_score = -1.0
+
+        for global_id, info in speaker_blueprints.items():
+            if global_id in used_global_ids:
+                continue
+            score = cosine_similarity(emb, info["centroid"])
+            if score > best_score:
+                best_score = score
+                best_global_id = global_id
+
+        if best_global_id is not None and best_score >= BLUEPRINT_MATCH_THRESHOLD:
+            local_to_global[local_spk] = best_global_id
+            used_global_ids.add(best_global_id)
+            update_blueprint(best_global_id, emb)
+            print(f"🔗 Matched local {local_spk} -> {best_global_id} (score={best_score:.3f})")
+        else:
+            new_global_id = get_next_global_speaker_id(list(speaker_blueprints.keys()) + list(local_to_global.values()))
+            local_to_global[local_spk] = new_global_id
+            used_global_ids.add(new_global_id)
+            update_blueprint(new_global_id, emb)
+            print(f"🆕 New global speaker created: {local_spk} -> {new_global_id}")
+
+    return local_to_global
+
+def relabel_diarization_df_to_global(diarize_df: pd.DataFrame, local_to_global: Dict[str, str]) -> pd.DataFrame:
+    diarize_df = diarize_df.copy()
+    diarize_df["speaker"] = diarize_df["speaker"].map(lambda x: local_to_global.get(x, x))
+    return diarize_df
+
+def deduplicate_overlap_segments(all_segments: List[Dict[str, Any]], overlap_start_cutoff: float) -> List[Dict[str, Any]]:
+    """
+    Remove duplicated chunk-overlap segments by keeping only segments whose midpoint is past overlap cutoff.
+    """
+    filtered = []
+    for seg in all_segments:
+        midpoint = (float(seg.get("start", 0)) + float(seg.get("end", 0))) / 2.0
+        if midpoint >= overlap_start_cutoff:
+            filtered.append(seg)
+    return filtered
+
+# LOAD MODELS / AUDIO
+
+print("🎹 Loading transcription model...")
+turbo_model_id = "deepdml/faster-whisper-large-v3-turbo-ct2"
+torch.serialization.add_safe_globals([ListConfig, ContainerMetadata, DictConfig])
+
+model = whisperx.load_model(turbo_model_id, device, compute_type=compute_type)
+
+print("🧑‍🧑 Loading diarization model...")
+from whisperx.diarize import DiarizationPipeline
+diarize_model = DiarizationPipeline(use_auth_token=hf_token, device=device)
+
+print("Loading speaker embedding model...")
+speaker_encoder = EncoderClassifier.from_hparams(
+    source="speechbrain/spkrec-ecapa-voxceleb",
+    run_opts={"device": device}
+)
+
+audio = whisperx.load_audio(audio_file)
+total_seconds = len(audio) / SAMPLE_RATE
+chunk_ranges = get_chunk_ranges(total_seconds, CHUNK_SECONDS, CHUNK_OVERLAP_SECONDS)
+
+print(f"📦 Audio split into {len(chunk_ranges)} chunk(s) of ~5 minutes")
+
+
+# PROCESS CHUNKS
+
+all_final_segments = []
+all_final_word_segments = []
+detected_language = result.get("language")
+align_model = None
+metadata = None
+
+for chunk_idx, (chunk_start, chunk_end) in enumerate(chunk_ranges):
+    print(f"\n📦 Processing chunk {chunk_idx + 1}/{len(chunk_ranges)}: {chunk_start:.2f}s -> {chunk_end:.2f}s")
+
+    chunk_audio = slice_audio(audio, chunk_start, chunk_end, SAMPLE_RATE)
+    if len(chunk_audio) == 0:
+        continue
+
+    # 1. TRANSCRIBE CHUNK
+    local_result = model.transcribe(chunk_audio, batch_size=batch_size, language=detected_language)
+    if detected_language is None:
+        detected_language = local_result.get("language")
+        print(f"🌍 Detected language: {detected_language}")
+
+    # 2. ALIGN CHUNK
+    if align_model is None:
+        print("🔧 Loading alignment model...")
+        align_model, metadata = whisperx.load_align_model(language_code=detected_language, device=device)
+
     align_output = whisperx.align(
-        result.get('segments', []),
+        local_result.get("segments", []),
         align_model,
         metadata,
-        audio,
+        chunk_audio,
         device,
         return_char_alignments=False
     )
-    result['segments'] = align_output['segments']
-    if 'word_segments' in align_output:
-        result['word_segments'] = align_output['word_segments']
-    stage = 2
-    cp_data = {
-        'stage': stage,
-        'language': result.get('language'),
-        'segments': result['segments'],
-        'word_segments': result.get('word_segments', []),
-        'last_printed': last_printed
-    }
-    with open(checkpoint_path, 'w') as f:
-        json.dump(cp_data, f, indent=2)
-    print(f"📅 Checkpoint saved after alignment (stage=2)")
+    local_result["segments"] = align_output["segments"]
+    if "word_segments" in align_output:
+        local_result["word_segments"] = align_output["word_segments"]
 
-# 3. DIARIZE and MAPPING
-    if stage < 3:
-        if audio is None:
-            audio = whisperx.load_audio(audio_file)
+    # 3. DIARIZE CHUNK
+    print("👂 Running diarization...")
+    diarization_output = diarize_model(
+        chunk_audio,
+        min_speakers=DIAR_MIN_SPEAKERS,
+        max_speakers=DIAR_MAX_SPEAKERS
+    )
 
-        print("🧑‍🧑 Loading diarization model...")
-        from whisperx.diarize import DiarizationPipeline
-        from collections import Counter
+    diarize_df = convert_diarization_output_to_df(diarization_output)
 
-        diarize_model = DiarizationPipeline(use_auth_token=hf_token, device=device)
-        print("👂 Running diarization...")
-        # This identifies the timing for Speakers
-        diarization_output = diarize_model(audio, min_speakers=2, max_speakers=2)
+    if diarize_df.empty:
+        print("⚠️ No diarization segments found in this chunk.")
+        shifted_result = shift_result_timestamps(local_result, chunk_start)
+        all_final_segments.extend(shifted_result["segments"])
+        all_final_word_segments.extend(shifted_result["word_segments"])
+        continue
 
-        # Standardize diarization segments into a DataFrame
-        if hasattr(diarization_output, 'itertracks'):
-            diarize_segments = [{'start': t.start, 'end': t.end, 'speaker': s} for t, _, s in
-                                diarization_output.itertracks(yield_label=True)]
+    # 4. BUILD LOCAL EMBEDDINGS
+    local_embeddings = extract_local_speaker_embeddings(diarize_df, chunk_audio, speaker_encoder)
+
+    # Fallback: if a local speaker got no embedding, preserve it with a new global ID
+    local_speakers = list(diarize_df["speaker"].unique())
+    local_to_global = {}
+
+    if local_embeddings:
+        local_to_global = match_local_speakers_to_global(local_embeddings)
+
+    for local_spk in local_speakers:
+        if local_spk not in local_to_global:
+            new_global_id = get_next_global_speaker_id(list(speaker_blueprints.keys()) + list(local_to_global.values()))
+            local_to_global[local_spk] = new_global_id
+            print(f"🆕 Fallback global speaker created: {local_spk} -> {new_global_id}")
+
+    # 5. RELABEL LOCAL DIARIZATION WITH GLOBAL IDs
+    diarize_df = relabel_diarization_df_to_global(diarize_df, local_to_global)
+
+    # 6. ASSIGN WORD SPEAKERS
+    local_result = whisperx.assign_word_speakers(diarize_df, local_result)
+
+    # 7. CLEAN RANDOM LABELS AGAINST GLOBAL DIARIZATION
+    print("🔍 Running Speaker Alignment (Cleaning labels)...")
+    M_labels = set()
+    for segment in local_result["segments"]:
+        for word in segment.get("words", []):
+            if "speaker" in word:
+                M_labels.add(word["speaker"])
+
+    label_mapping_table = {}
+    for M_label in M_labels:
+        if str(M_label).startswith("SPEAKER_"):
+            label_mapping_table[M_label] = M_label
+            continue
+
+        overlaps = []
+        for segment in local_result["segments"]:
+            for word in segment.get("words", []):
+                if word.get("speaker") == M_label:
+                    w_s, w_e = word["start"], word["end"]
+                    matches = diarize_df[(diarize_df["start"] < w_e) & (diarize_df["end"] > w_s)]
+                    if not matches.empty:
+                        overlaps.extend(matches["speaker"].tolist())
+
+        if overlaps:
+            label_mapping_table[M_label] = Counter(overlaps).most_common(1)[0][0]
         else:
-            diarize_segments = diarization_output.to_dict('records')
+            label_mapping_table[M_label] = "Unknown"
 
-        diarize_df = pd.DataFrame(diarize_segments)
+    for segment in local_result["segments"]:
+        valid_segment_speakers = []
+        for word in segment.get("words", []):
+            original_label = word.get("speaker")
+            fixed_label = label_mapping_table.get(original_label, "Unknown")
+            word["speaker"] = fixed_label
+            if fixed_label != "Unknown":
+                valid_segment_speakers.append(fixed_label)
 
-        #FIX: Force Chronological Labeling ---
-        # 1. Find the first time each speaker appears
-        first_appearances = diarize_df.groupby('speaker')['start'].min().sort_values()
-        
-        # 2. Map the model's random IDs to 00, 01, 02, 03, etc based on appearance order
-        chrono_map = {old_id: f"SPEAKER_{i:02d}" for i, old_id in enumerate(first_appearances.index)}
-        
-        # 3. Apply the mapping to the dataframe
-        diarize_df['speaker'] = diarize_df['speaker'].map(chrono_map)
-        print(f"🔄 Re-mapped speakers by order of apperance: {chrono_map}")
-        # ---------------------------------------------
+        if valid_segment_speakers:
+            segment["speaker"] = Counter(valid_segment_speakers).most_common(1)[0][0]
 
-        # Initial assignment (This is where random ID's can potentially be created by the Model)
-        result = whisperx.assign_word_speakers(diarize_df, result)
+    # 8. SHIFT TO ABSOLUTE TIMES
+    shifted_result = shift_result_timestamps(local_result, chunk_start)
 
-        print("🔍 Running Speaker Alignment (Cleaning labels)...")
+    # 9. REMOVE DUPLICATES FROM OVERLAP
+    if chunk_idx == 0:
+        kept_segments = shifted_result["segments"]
+    else:
+        overlap_cutoff = chunk_start + (CHUNK_OVERLAP_SECONDS / 2.0)
+        kept_segments = deduplicate_overlap_segments(shifted_result["segments"], overlap_cutoff)
 
-        # (Part 1) Identify all unique labels the model actually generated (including random ones)
-        M_labels = set()
-        for segment in result["segments"]:
-            for word in segment.get("words", []):
-                if "speaker" in word:
-                    M_labels.add(word["speaker"])
+    all_final_segments.extend(kept_segments)
+    all_final_word_segments.extend(shifted_result["word_segments"])
 
-        # (Part 2) Create a dynamic mapping table
-        label_mapping_table = {}
-        for M_label in M_labels:
-            # If it's already a standard speaker ID, keep it as is
-            if str(M_label).startswith("SPEAKER_"):
-                label_mapping_table[M_label] = M_label
-                continue
+    # 10. CHECKPOINT
+    stage = 3
+    save_checkpoint(
+        stage_val=stage,
+        language_val=detected_language,
+        segments_val=all_final_segments,
+        word_segments_val=all_final_word_segments,
+        last_printed_val=last_printed,
+        blueprints_val=speaker_blueprints
+    )
+    print(f"📦 Checkpoint saved after chunk {chunk_idx + 1}")
 
-            overlaps = []
-            # Find every word where the Model used this specific label
-            for segment in result["segments"]:
-                for word in segment.get("words", []):
-                    if word.get("speaker") == M_label:
-                        w_s, w_e = word["start"], word["end"]
-                        # Find which 'SPEAKER_XX' was officially talking during this word's time
-                        matches = diarize_df[(diarize_df['start'] < w_e) & (diarize_df['end'] > w_s)]
-                        if not matches.empty:
-                            overlaps.extend(matches['speaker'].tolist())
-
-            # Assign the random label (letters etc.) to the real speaker ID it matched most often
-            if overlaps:
-                label_mapping_table[M_label] = Counter(overlaps).most_common(1)[0][0]
-            else:
-                label_mapping_table[M_label] = "Unknown"
-
-        # (Part 3) Apply the mapping to fix the final result
-        for segment in result["segments"]:
-            valid_segment_speakers = []
-            for word in segment.get("words", []):
-                original_label = word.get("speaker")
-                fixed_label = label_mapping_table.get(original_label, "Unknown")
-                word["speaker"] = fixed_label
-                if fixed_label != "Unknown":
-                    valid_segment_speakers.append(fixed_label)
-
-            # Force the overall segment speaker to match the most frequent word speaker
-            if valid_segment_speakers:
-                segment["speaker"] = Counter(valid_segment_speakers).most_common(1)[0][0]
-            else:
-                # Fallback to whatever the segment already had if words aren't tagged
-                pass
-
-        stage = 3
-    cp_data = {
-        'stage': stage,
-        'language': result.get('language'),
-        'segments': result.get('segments', []),
-        'word_segments': result.get('word_segments', []),
-        'last_printed': last_printed
-    }
-    with open(checkpoint_path, 'w') as f:
-        json.dump(cp_data, f, indent=2)
-    print(f"📅 Checkpoint saved after diarization (stage=3)")
+# Final result
+result = {
+    "language": detected_language,
+    "segments": all_final_segments,
+    "word_segments": all_final_word_segments
+}
 
 # PERIODIC CHECKPOINT DURING PRINTING
 auto_checkpoint = time.time()
 
 # PRINT AND BUILD READABLE TRANSCRIPT
 print("🎤 Final transcript:")
-with open(transcript_path, 'a') as tf:
-    segments = result.get('segments', [])
+with open(transcript_path, "w") as tf:
+    segments = result.get("segments", [])
     for idx in range(last_printed, len(segments)):
         segment = segments[idx]
-        start = segment.get('start', 0)
-        end = segment.get('end', 0)
-        speaker_id = segment.get('speaker', 'Unknown')
-        speaker = speaker_map.get(speaker_id, speaker_id)  # fallback to ID if not mapped
-        text = segment.get('text', '').strip()
+        start = segment.get("start", 0)
+        end = segment.get("end", 0)
+        speaker_id = segment.get("speaker", "Unknown")
+        speaker = speaker_map.get(speaker_id, speaker_id)
+        text = segment.get("text", "").strip()
         line = f"[{start:.2f}-{end:.2f}] {speaker}: {text}"
         print(line)
         tf.write(f"{line}\n")
         last_printed += 1
 
-        # auto JSON checkpoint
         if time.time() - auto_checkpoint > checkpoint_interval:
-            cp_data = {
-                'stage': stage,
-                'language': result.get('language'),
-                'segments': segments,
-                'word_segments': result.get('word_segments', []),
-                'last_printed': last_printed
-            }
-            with open(checkpoint_path, 'w') as f:
-                json.dump(cp_data, f, indent=2)
+            save_checkpoint(
+                stage_val=stage,
+                language_val=result.get("language"),
+                segments_val=segments,
+                word_segments_val=result.get("word_segments", []),
+                last_printed_val=last_printed,
+                blueprints_val=speaker_blueprints
+            )
             print(f"📅 Auto-checkpoint at segment {idx}")
             auto_checkpoint = time.time()
 
 # FINAL SAVE
-cp_data = {
-    'stage': stage,
-    'language': result.get('language'),
-    'segments': segments,
-    'word_segments': result.get('word_segments', []),
-    'last_printed': last_printed
-}
-with open(checkpoint_path, 'w') as f:
-    json.dump(cp_data, f, indent=2)
+save_checkpoint(
+    stage_val=stage,
+    language_val=result.get("language"),
+    segments_val=result.get("segments", []),
+    word_segments_val=result.get("word_segments", []),
+    last_printed_val=last_printed,
+    blueprints_val=speaker_blueprints
+)
+
 print(f"📄 Transcript saved to {transcript_path}")
 
 # CLEAN UP
