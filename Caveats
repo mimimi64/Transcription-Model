@@ -6,4 +6,4 @@ and see if this helps.
 
 It's worth noting that sometimes if a speaker coughs or breathes before someone else you have listed speaks first, like in the first few seconds
 of the audio especially, the model can allocate the name you put second as the first person to talk of those two. You may want to switch round 
-names in this case.
+names in this case, whichever model you are using.
