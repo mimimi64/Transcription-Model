@@ -6,4 +6,7 @@ and see if this helps.
 
 It's worth noting that sometimes if a speaker coughs or breathes before someone else you have listed speaks first, like in the first few seconds
 of the audio especially, the model can allocate the name you put second as the first person to talk of those two. You may want to switch round 
-names in this case, whichever model you are using.
+names in this case, whichever model you are using. This can also happen silently in a way that you dont hear but the model does, or at least, 
+thinks it does, In which case, it can appear as though the model was wrong and switched round speakers, when it wasn't/didn't, at least according to itslef.
+Even when "wrong", things will still stay consistent after this point when it initially decides who is who, proof that the diarisation and 
+speaker "blueprinting" is working.
