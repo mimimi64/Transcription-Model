@@ -372,7 +372,7 @@ audio = whisperx.load_audio(audio_file)
 total_seconds = len(audio) / SAMPLE_RATE
 chunk_ranges = get_chunk_ranges(total_seconds, CHUNK_SECONDS, CHUNK_OVERLAP_SECONDS)
 
-print(f"📦 Audio split into {len(chunk_ranges)} chunk(s) of ~5 minutes")
+print(f"📦 Audio split into {len(chunk_ranges)} chunk(s) of ~3 minutes")
 
 
 # PROCESS CHUNKS
