@@ -1,6 +1,6 @@
 Pipeline to Pipeline transcription model built off of the WhisperX library with Pyannote. Comes with Word Alignment, and Speaker Diarization (identifying who said what). 
 
-Note: I have recently fixed an issue where speakers were not always being mapped in order of appearance. The highest number of speakers I have tested the model with is 4, which works perfectly, but you need to be the one to tell the transcription model the order of appearance of each speaker, in the code.
+Note: The second branch is a version of the model catering to background noise which is specifically other people talking, but this version can also deal with other types of backgroud noise.
 
 This transcription tool stays entirely local to your device, so your data and your audios are too, whereas in commercial software you pay for, your data/audio is often sent to a 3rd party cloud or database that is out of your control. With this, one can have data sovereignty at no cost.
 
